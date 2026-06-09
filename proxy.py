@@ -386,10 +386,8 @@ def anthropic_to_codex(anth_req: AnthropicRequest) -> dict[str, Any]:
         "stream": True,
         "store": False,
     }
-    if anth_req.temperature is not None:
-        body["temperature"] = anth_req.temperature
-    if anth_req.top_p is not None:
-        body["top_p"] = anth_req.top_p
+    # Codex Responses API 不支持 temperature/top_p
+    # Claude Code v2 可能会发送这些参数，忽略即可
     if tools:
         body["tools"] = tools
     if tool_choice != "auto" or tools:
@@ -404,11 +402,9 @@ def anthropic_to_codex(anth_req: AnthropicRequest) -> dict[str, Any]:
 class CodexStreamTranslator:
     """将 ChatGPT Backend 的 SSE 流转换为 Anthropic Messages API 格式的 SSE 流。"""
 
-    def __init__(self, request_id: str, codex_model: str):
+    def __init__(self, request_id: str, anthropic_model: str):
         self.request_id = request_id
-        self.anthropic_model = REVERSE_MODEL_MAP.get(
-            codex_model, DEFAULT_ANTHROPIC_MODEL
-        )
+        self.anthropic_model = anthropic_model
         self._message_started = False
         self._content_block_started = False
         self._buffer = ""
@@ -633,11 +629,10 @@ async def _anthropic_exception_handler(_request: Request, exc: HTTPException) ->
 # ── SSE 流式响应生成器 ────────────────────────────────────────────────────
 async def codex_stream_to_anthropic_sse(
     request_id: str,
-    codex_model: str,
+    anthropic_model: str,
     codex_response: httpx.Response,
 ) -> AsyncIterator[str]:
-    """将 ChatGPT Backend SSE 流转换为 Anthropic SSE 流。"""
-    translator = CodexStreamTranslator(request_id, codex_model)
+    translator = CodexStreamTranslator(request_id, anthropic_model)
     current_event = ""
 
     async for raw_line in codex_response.aiter_lines():
@@ -803,7 +798,7 @@ async def proxy_messages(request: Request):
         if anthropic_version:
             resp_headers["anthropic-version"] = anthropic_version
         return StreamingResponse(
-            codex_stream_to_anthropic_sse(request_id, codex_model, codex_resp),
+            codex_stream_to_anthropic_sse(request_id, anthro_request.model, codex_resp),
             media_type="text/event-stream",
             headers=resp_headers,
         )
@@ -811,7 +806,7 @@ async def proxy_messages(request: Request):
     # ── 7. 非流式响应 ──
     # ChatGPT Backend 强制 stream=True，所以需要缓冲流式响应
     request_id = f"{PROXY_REQUEST_ID_PREFIX}{uuid.uuid4().hex[:24]}"
-    translator = CodexStreamTranslator(request_id, codex_model)
+    translator = CodexStreamTranslator(request_id, anthro_request.model)
     current_event = ""
     final_response_data: dict[str, Any] | None = None
 
@@ -840,7 +835,7 @@ async def proxy_messages(request: Request):
             current_event = ""
 
     # 从 translator 的缓冲和 completed 事件构建响应
-    anthropic_model = REVERSE_MODEL_MAP.get(codex_model, DEFAULT_ANTHROPIC_MODEL)
+    anthropic_model = anthro_request.model
     output_text = translator._buffer
 
     content_blocks: list[dict[str, Any]] = []
