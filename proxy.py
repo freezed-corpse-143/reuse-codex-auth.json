@@ -28,11 +28,14 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 # ── 日志 ──────────────────────────────────────────────────────────────────
+_log_level_name = os.environ.get("CODEX_LOG_LEVEL", "INFO").upper()
+_log_level = getattr(logging, _log_level_name, logging.INFO)
 logging.basicConfig(
-    level=logging.INFO,
+    level=_log_level,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("codex-proxy")
+log.info("日志级别: %s", _log_level_name)
 
 # ── 配置 ──────────────────────────────────────────────────────────────────
 AUTH_JSON_PATH = Path(os.environ.get("CODEX_AUTH_PATH", "auth.json"))
@@ -415,6 +418,7 @@ def anthropic_to_codex(anth_req: AnthropicRequest) -> dict[str, Any]:
     if anth_req.stop_sequences:
         body["stop"] = anth_req.stop_sequences
 
+    log.debug("Codex 请求体: %s", json.dumps(body, ensure_ascii=False, default=str))
     return body
 
 
@@ -430,12 +434,12 @@ class CodexStreamTranslator:
         self._content_index = 0       # 当前 content block 序号
         self._buffer = ""             # text_delta 累积
         self._has_tool_use = False    # 本轮是否有 tool_use 输出
-
     def process_event(
         self, event_name: str, data: dict[str, Any]
     ) -> list[tuple[str, str]]:
         """处理一条 SSE 事件，返回 0~N 条 Anthropic 格式的 (event, data) 元组。"""
         events: list[tuple[str, str]] = []
+        log.debug("SSE ← %s %s", event_name, json.dumps(data, default=str)[:200])
 
         if event_name == "response.created":
             events.extend(self._on_created())
