@@ -18,9 +18,13 @@ ls auth.json
 # 2. Start the proxy
 uv run codex-proxy
 
-# 3. In another terminal, point Claude Code at the proxy
+# 3. In another terminal, point Claude Code at the proxy.
+#    IMPORTANT: Unset HTTPS_PROXY/HTTP_PROXY — Claude Code v2 uses them
+#    to reach api.anthropic.com directly, bypassing the local proxy.
+#    The proxy itself will still use these vars for outbound traffic.
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
 export ANTHROPIC_API_KEY=sk-any-value
+unset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy
 
 # 4. Claude Code now routes through the proxy
 claude --print "your prompt"
@@ -99,7 +103,43 @@ Edit `config.json` freely — missing keys merge with built-in defaults, so only
 - **Tool calls** — `tool_use`/`tool_result` content blocks are passed through as text context
 - **anthropic-version header** — forwarded from request to response
 
-## Changelog (v0.3.0)
+## Troubleshooting
+
+### Claude Code v2 hangs or ignores the proxy
+
+**Symptom**: Claude Code returns "Invalid API key" or hangs without output when `ANTHROPIC_BASE_URL` is set.
+
+**Cause**: `HTTPS_PROXY` or `HTTP_PROXY` is set. Claude Code v2 uses these env vars to connect
+to `api.anthropic.com` directly instead of the local proxy.
+
+**Fix**: Unset proxy env vars in the Claude Code terminal:
+
+```bash
+unset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
+export ANTHROPIC_API_KEY=sk-any-value
+claude --print "your prompt"
+```
+
+The proxy process itself retains `HTTPS_PROXY` for its own outbound traffic to chatgpt.com.
+If both processes share a terminal, start the proxy first, then run claude with `env -u`:
+
+```bash
+env -u HTTPS_PROXY -u HTTP_PROXY \
+  ANTHROPIC_BASE_URL=http://127.0.0.1:8080 \
+  ANTHROPIC_API_KEY=sk-any-value \
+  claude --print "your prompt"
+```
+
+
+## Changelog
+
+### v0.3.1
+
+- Documented `HTTPS_PROXY`/`HTTP_PROXY` conflict with Claude Code v2 in Quick Start
+- Added Troubleshooting section with env var conflict resolution
+
+### v0.3.0
 
 - Configurable model mapping via `config.json` instead of hardcoded dict
 - `POST /v1/responses` — OpenAI Responses API proxy
