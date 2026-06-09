@@ -79,6 +79,14 @@ _DEFAULT_OAI_MAP: dict[str, str] = {
     "o3": "gpt-5.5",
     "o4-mini": "gpt-5.4-mini",
 }
+_DEFAULT_RESPONSES_MAP: dict[str, str] = {
+    "gpt-4o": "gpt-5.5",
+    "gpt-4o-mini": "gpt-5.4-mini",
+    "gpt-4.1": "gpt-5.5",
+    "o3": "gpt-5.5",
+    "o4-mini": "gpt-5.4-mini",
+    "o1": "gpt-5.5",
+}
 
 
 def _load_config() -> dict[str, Any]:
@@ -107,18 +115,19 @@ def _load_config() -> dict[str, Any]:
         "model_mapping": _merge("model_mapping", _DEFAULT_MODEL_MAP),
         "reverse_model_mapping": _merge("reverse_model_mapping", _DEFAULT_REVERSE),
         "oai_model_mapping": _merge("oai_model_mapping", _DEFAULT_OAI_MAP),
+        "responses_model_mapping": _merge("responses_model_mapping", _DEFAULT_RESPONSES_MAP),
         "default_anthropic_model": (
             cfg.get("default_anthropic_model") or "claude-sonnet-4-20250514"
         ),
         "default_codex_model": cfg.get("default_codex_model") or "gpt-5.5",
     }
 
-
 _CONFIG = _load_config()
 MODEL_MAP: dict[str, str] = _CONFIG["model_mapping"]
 REVERSE_MODEL_MAP: dict[str, str] = _CONFIG["reverse_model_mapping"]
 OAI_MODEL_MAP: dict[str, str] = _CONFIG["oai_model_mapping"]
 DEFAULT_ANTHROPIC_MODEL: str = _CONFIG["default_anthropic_model"]
+RESPONSES_MODEL_MAP: dict[str, str] = _CONFIG["responses_model_mapping"]
 DEFAULT_CODEX_MODEL: str = _CONFIG["default_codex_model"]
 PROXY_REQUEST_ID_PREFIX = "msg_"
 
@@ -1121,6 +1130,202 @@ async def proxy_chat_completions(request: Request):
         },
     })
 
+# ── OpenAI Responses API 兼容 ──────────────────────────────────────────────
+RESPONSES_REQUEST_ID_PREFIX = "resp_"
+
+
+async def _responses_stream_to_openai(
+    request_id: str,
+    model: str,
+    codex_response: httpx.Response,
+) -> AsyncIterator[str]:
+    """Pass through Codex SSE events, mapping model names in data payloads."""
+    current_event = ""
+    async for raw_line in codex_response.aiter_lines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("event: "):
+            current_event = line[7:]
+            yield f"{line}\n"
+            continue
+        if line.startswith("data: ") and current_event:
+            json_str = line[6:]
+            try:
+                data = json.loads(json_str)
+            except json.JSONDecodeError:
+                yield f"{line}\n"
+                continue
+            # Map model name in completed/failed events
+            if current_event in ("response.completed", "response.failed"):
+                resp = data.get("response", data)
+                if isinstance(resp, dict):
+                    resp["model"] = model
+                data["model"] = model
+            yield f"data: {json.dumps(data)}\n\n"
+            current_event = ""
+
+
+@app.post("/v1/responses")
+async def proxy_responses(request: Request):
+    """Receive OpenAI Responses API request, forward to ChatGPT Backend, return OpenAI format."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    if http_client is None:
+        raise HTTPException(status_code=500, detail="HTTP client not initialized")
+
+    stream = body.get("stream", False)
+    model = body.get("model", "gpt-4o")
+    codex_model = RESPONSES_MODEL_MAP.get(model, DEFAULT_CODEX_MODEL)
+
+    log.info(
+        "-> [resp] %s -> %s  stream=%s", model, codex_model, stream,
+    )
+
+    try:
+        token = await auth.ensure_token()
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "ChatGPT-Account-ID": auth.account_id,
+        "Origin": "https://chatgpt.com",
+        "User-Agent": "Codex-CLI/1.0",
+    }
+    # Build the backend body: normalize input, map model, pass through known fields
+    raw_input = body.get("input", "")
+    if isinstance(raw_input, str):
+        codex_input: list[dict[str, Any]] = [{"role": "user", "content": raw_input}]
+    elif isinstance(raw_input, list):
+        codex_input = raw_input
+    else:
+        codex_input = []
+
+    codex_body: dict[str, Any] = {
+        "model": codex_model,
+        "input": codex_input,
+        "instructions": body.get("instructions", "You are a helpful assistant."),
+        "stream": True,
+        "store": body.get("store", False),
+    }
+    for key in ("temperature", "top_p", "tools", "tool_choice", "stop"):
+        if key in body:
+            codex_body[key] = body[key]
+
+    codex_resp = await http_client.post(
+        f"{CODEX_BASE_URL}/responses",
+        json=codex_body,
+        headers=headers,
+    )
+
+    if codex_resp.status_code >= 400:
+        error_detail = await codex_resp.aread()
+        err_text = error_detail.decode(errors="replace")
+        log.error("Codex backend error: HTTP %s %s", codex_resp.status_code, err_text)
+        if codex_resp.status_code == 401:
+            try:
+                auth.refresh()
+                token = auth.access_token
+                headers["Authorization"] = f"Bearer {token}"
+                codex_resp = await http_client.post(
+                    f"{CODEX_BASE_URL}/responses",
+                    json=codex_body,
+                    headers=headers,
+                )
+                if codex_resp.status_code >= 400:
+                    err2 = await codex_resp.aread()
+                    raise HTTPException(
+                        status_code=codex_resp.status_code, detail=err2.decode(errors="replace")
+                    )
+            except HTTPException:
+                raise
+            except Exception as exc:
+                raise HTTPException(status_code=502, detail=str(exc))
+        else:
+            raise HTTPException(status_code=codex_resp.status_code, detail=err_text)
+
+    if stream:
+        request_id = f"{RESPONSES_REQUEST_ID_PREFIX}{uuid.uuid4().hex[:24]}"
+        return StreamingResponse(
+            _responses_stream_to_openai(request_id, model, codex_resp),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+        )
+
+    # Non-streaming: buffer SSE events, assemble Responses API response
+    request_id = f"{RESPONSES_REQUEST_ID_PREFIX}{uuid.uuid4().hex[:24]}"
+    current_event = ""
+    full_text = ""
+    output_items: list[dict[str, Any]] = []
+    final_resp: dict[str, Any] | None = None
+
+    async for raw_line in codex_resp.aiter_lines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("event: "):
+            current_event = line[7:]
+            continue
+        if line.startswith("data: ") and current_event:
+            json_str = line[6:]
+            try:
+                data = json.loads(json_str)
+            except json.JSONDecodeError:
+                continue
+
+            if current_event == "response.output_text.delta":
+                full_text += data.get("delta", "")
+            elif current_event == "response.output_item.added":
+                item = data.get("item", data)
+                if isinstance(item, dict):
+                    output_items.append(item)
+            elif current_event == "response.content_part.added":
+                part = data.get("part", data)
+                if isinstance(part, dict):
+                    if output_items:
+                        output_items[-1].setdefault("content", []).append(part)
+            elif current_event == "response.completed":
+                final_resp = data.get("response", data)
+            elif current_event == "response.failed":
+                error_msg = data.get("error", {}).get("message", str(data))
+                raise HTTPException(status_code=502, detail=error_msg)
+
+            current_event = ""
+
+    # Merge accumulated delta text into the last output item's content
+    if full_text and output_items:
+        last = output_items[-1]
+        if last.get("type") in ("message",) and "content" in last:
+            for c in last["content"]:
+                if isinstance(c, dict) and c.get("type") in ("output_text", "text") and c.get("text", "") == "":
+                    c["text"] = full_text
+
+    if not output_items and full_text:
+        output_items.append({
+            "type": "message",
+            "id": f"msg_{uuid.uuid4().hex[:24]}",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": full_text}],
+        })
+
+    usage = (final_resp or {}).get("usage", {}) or {}
+
+    return JSONResponse(content={
+        "id": request_id,
+        "object": "response",
+        "created": int(time.time()),
+        "model": model,
+        "output": output_items,
+        "usage": {
+            "input_tokens": usage.get("input_tokens", 0),
+            "output_tokens": usage.get("output_tokens", 0),
+        },
+    })
 # ── 入口 ──────────────────────────────────────────────────────────────────
 def main():
     import uvicorn

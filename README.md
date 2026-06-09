@@ -56,6 +56,12 @@ Model mappings are loaded from `config.json` at startup. If the file is missing 
     "gpt-4o": "gpt-5.5",
     "gpt-4o-mini": "gpt-5.4-mini"
   },
+  "responses_model_mapping": {
+    "gpt-4o": "gpt-5.5",
+    "gpt-4o-mini": "gpt-5.4-mini",
+    "o3": "gpt-5.5",
+    "o4-mini": "gpt-5.4-mini"
+  },
   "reverse_model_mapping": {
     "gpt-5.5": "claude-sonnet-4-20250514",
     "gpt-5.4-mini": "claude-3-5-haiku-latest"
@@ -65,12 +71,13 @@ Model mappings are loaded from `config.json` at startup. If the file is missing 
 }
 ```
 
-- `model_mapping` — Anthropic model name → Codex model name (used for incoming `/v1/messages` requests).
+- `model_mapping` — Anthropic model name → Codex model name (used for `/v1/messages`).
 - `oai_model_mapping` — OpenAI model name → Codex model name (used for `/v1/chat/completions`).
-- `reverse_model_mapping` — Codex model name → Anthropic model name (used in responses).
-- Any model not in the map falls back to `default_codex_model` / `default_anthropic_model`.
+- `responses_model_mapping` — OpenAI model name → Codex model name (used for `/v1/responses`).
+- `reverse_model_mapping` — Codex model name → Anthropic model name (used in Anthropic responses).
+- Any model not in a map falls back to `default_codex_model` / `default_anthropic_model`.
 
-Edit `config.json` freely — missing keys merge with built-in defaults so you only need to specify overrides.
+Edit `config.json` freely — missing keys merge with built-in defaults, so only specify overrides.
 
 ## API Endpoints
 
@@ -81,6 +88,7 @@ Edit `config.json` freely — missing keys merge with built-in defaults so you o
 | `GET /v1/models` | Anthropic | List available models (deduplicated) |
 | `POST /v1/messages` | Anthropic | Main entry — Anthropic Messages API proxy |
 | `POST /v1/chat/completions` | OpenAI | OpenAI Chat Completions proxy |
+| `POST /v1/responses` | OpenAI | OpenAI Responses API proxy |
 
 ## Features
 
@@ -94,11 +102,13 @@ Edit `config.json` freely — missing keys merge with built-in defaults so you o
 ## Changelog (v0.3.0)
 
 - Configurable model mapping via `config.json` instead of hardcoded dict
+- `POST /v1/responses` — OpenAI Responses API proxy
+- `responses_model_mapping` key in `config.json`
 - Atomic tmp+rename writes for auth.json safety
 - `anthropic-version` header passthrough
 - Error responses in Anthropic `{"type":"error"}` format
 - Proper `tool_use`/`tool_result` content block handling
-- OpenAI `/v1/chat/completions` endpoint
+- `POST /v1/chat/completions` — OpenAI Chat Completions proxy
 - Root `HEAD /` route for Claude Code connectivity check
 - Fixed `metadata` and `user` unsupported parameter errors
 - `uv run codex-proxy` entry point
