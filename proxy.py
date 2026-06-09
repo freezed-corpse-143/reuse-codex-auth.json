@@ -283,39 +283,89 @@ class AnthropicRequest(BaseModel):
     tools: list[dict[str, Any]] | None = None
     tool_choice: Any | None = None
     metadata: dict[str, Any] | None = None
+    thinking: dict[str, Any] | None = None        # Claude v2 extended thinking（Codex 不支持，仅防止静默丢弃）
 
+def _convert_message(msg: AnthropicMessage) -> list[dict[str, Any]]:
+    """将一条 Anthropic 消息转换为 0~N 条 Codex input items。
 
-# ── Anthropic → Codex (ChatGPT Backend) 翻译 ─────────────────────────────
-def _extract_text(content: str | list[dict[str, Any]] | None) -> str:
-    """提取 Anthropic content 中的纯文本，遇非 text block 发出警告。"""
+    处理 text / tool_use / tool_result / thinking 等 content block 类型。
+    """
+    content = msg.content
     if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    texts: list[str] = []
-    for block in content:
-        if isinstance(block, dict):
-            bt = block.get("type", "")
-            if bt == "text":
-                texts.append(block.get("text", ""))
-            elif bt == "tool_use":
-                name = block.get("name", "unknown")
-                inp = block.get("input", {})
-                texts.append(f"[tool_use: {name} args={json.dumps(inp)}]")
-            elif bt == "tool_result":
-                result_content = block.get("content", "")
-                if isinstance(result_content, list):
-                    for part in result_content:
-                        if isinstance(part, dict) and part.get("type") == "text":
-                            texts.append(part.get("text", ""))
-                elif isinstance(result_content, str):
-                    texts.append(result_content)
-            elif bt == "image":
-                texts.append("[image]")
-            else:
-                log.warning("未知 content block 类型: %s", bt)
-    return "\n".join(texts)
+        return []
 
+    # 纯字符串 content → 单条 item
+    if isinstance(content, str):
+        return [{"role": msg.role, "content": content}]
+
+    # 结构化 content (list of blocks)
+    items: list[dict[str, Any]] = []
+    text_parts: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+
+    def flush_text() -> None:
+        if text_parts:
+            items.append({"role": msg.role, "content": "".join(text_parts)})
+            text_parts.clear()
+
+    def flush_tool_calls() -> None:
+        if tool_calls:
+            flush_text()
+            items.append({"role": msg.role, "tool_calls": list(tool_calls)})
+            tool_calls.clear()
+
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        bt = block.get("type", "")
+
+        if bt == "text":
+            text_parts.append(block.get("text", ""))
+
+        elif bt == "tool_use":
+            flush_text()
+            name = block.get("name", "")
+            raw_input = block.get("input", {})
+            tool_calls.append({
+                "id": block.get("id", ""),
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(raw_input, ensure_ascii=False),
+                },
+            })
+
+        elif bt == "tool_result":
+            flush_text()
+            flush_tool_calls()
+            result_content = block.get("content", "")
+            if isinstance(result_content, list):
+                result_text = ""
+                for part in result_content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        result_text += part.get("text", "")
+            elif isinstance(result_content, str):
+                result_text = result_content
+            else:
+                result_text = str(result_content)
+            items.append({
+                "role": "tool",
+                "tool_call_id": block.get("tool_use_id", ""),
+                "content": result_text,
+            })
+
+        elif bt in ("thinking", "redacted_thinking"):
+            # Codex 不支持 reasoning/thinking 块，忽略
+            continue
+
+        else:
+            log.warning("未知 content block 类型: %s", bt)
+
+    # 刷新剩余缓冲区
+    flush_tool_calls()
+    flush_text()
+
+    return items
 
 def map_model(anthropic_model: str) -> str:
     """将 Anthropic 模型名映射为 Codex 模型名。"""
@@ -333,17 +383,12 @@ def _extract_system_text(system: str | list[dict[str, Any]] | None) -> str:
         if isinstance(block, dict) and block.get("type") in ("text", "ephemeral"):
             texts.append(block.get("text", ""))
     return "\n".join(texts) if texts else "You are a helpful assistant."
-
-
 def anthropic_to_codex(anth_req: AnthropicRequest) -> dict[str, Any]:
     """将 Anthropic Messages API 请求转换为 ChatGPT Backend Responses API 请求。"""
+    # 输入消息（结构化转换：text / tool_use / tool_result / thinking）
     openai_input: list[dict[str, Any]] = []
     for msg in anth_req.messages:
-        if msg.content is None:
-            continue
-        text = _extract_text(msg.content)
-        if text:
-            openai_input.append({"role": msg.role, "content": text})
+        openai_input.extend(_convert_message(msg))
 
     # instructions = system prompt（处理 string 和 list 两种格式）
     instructions = _extract_system_text(anth_req.system)
@@ -378,7 +423,7 @@ def anthropic_to_codex(anth_req: AnthropicRequest) -> dict[str, Any]:
             tool_choice = {"type": "function", "name": name}
 
     # 构建请求体
-    # ChatGPT Backend 要求 stream=True，且不支持 max_output_tokens
+    # ChatGPT Backend 要求 stream=True
     body: dict[str, Any] = {
         "model": map_model(anth_req.model),
         "input": openai_input,
@@ -386,7 +431,7 @@ def anthropic_to_codex(anth_req: AnthropicRequest) -> dict[str, Any]:
         "stream": True,
         "store": False,
     }
-    # Codex Responses API 不支持 temperature/top_p
+    # Codex Responses API 不支持 max_output_tokens / temperature / top_p
     # Claude Code v2 可能会发送这些参数，忽略即可
     if tools:
         body["tools"] = tools
@@ -407,7 +452,9 @@ class CodexStreamTranslator:
         self.anthropic_model = anthropic_model
         self._message_started = False
         self._content_block_started = False
-        self._buffer = ""
+        self._content_index = 0       # 当前 content block 序号
+        self._buffer = ""             # text_delta 累积
+        self._has_tool_use = False    # 本轮是否有 tool_use 输出
 
     def process_event(
         self, event_name: str, data: dict[str, Any]
@@ -460,17 +507,57 @@ class CodexStreamTranslator:
         return events
 
     def _ensure_content_block_started(self) -> list[tuple[str, str]]:
-        """如果还没发 content_block_start，先补发。"""
+        """如果还没发 content_block_start，先补发（text 类型）。"""
         events: list[tuple[str, str]] = []
         if not self._content_block_started:
             cb_start = {
                 "type": "content_block_start",
-                "index": 0,
+                "index": self._content_index,
                 "content_block": {"type": "text", "text": ""},
             }
             events.append(("content_block_start", json.dumps(cb_start)))
             self._content_block_started = True
         return events
+
+    def _emit_content_block_stop(self) -> list[tuple[str, str]]:
+        """如果 content_block 已开始，发送 content_block_stop。"""
+        if self._content_block_started:
+            self._content_block_started = False
+            self._content_index += 1
+            return [(
+                "content_block_stop",
+                json.dumps({"type": "content_block_stop", "index": self._content_index - 1}),
+            )]
+        return []
+
+    def _emit_tool_use_block(self, item: dict[str, Any]) -> list[tuple[str, str]]:
+        """将 Codex function_call item 转为 Anthropic tool_use content block。"""
+        fc = item.get("function_call", item.get("function", {}))
+        name = fc.get("name", "")
+        raw_args = fc.get("arguments", "{}")
+        try:
+            parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+        except json.JSONDecodeError:
+            parsed_args = {}
+
+        idx = self._content_index
+        self._content_index += 1
+        return [
+            ("content_block_start", json.dumps({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": item.get("id", ""),
+                    "name": name,
+                    "input": parsed_args,
+                },
+            })),
+            ("content_block_stop", json.dumps({
+                "type": "content_block_stop",
+                "index": idx,
+            })),
+        ]
 
     def _on_created(self) -> list[tuple[str, str]]:
         return self._ensure_message_started()
@@ -479,8 +566,14 @@ class CodexStreamTranslator:
         events: list[tuple[str, str]] = []
         events.extend(self._ensure_message_started())
         item = data.get("item", data)
-        if item.get("type") == "message":
+        itype = item.get("type", "")
+        if itype == "message":
             events.extend(self._ensure_content_block_started())
+        elif itype == "function_call":
+            # 关闭当前 text block（如果有），再发出 tool_use block
+            events.extend(self._emit_content_block_stop())
+            events.extend(self._emit_tool_use_block(item))
+            self._has_tool_use = True
         return events
 
     def _on_part_added(self, data: dict[str, Any]) -> list[tuple[str, str]]:
@@ -496,37 +589,30 @@ class CodexStreamTranslator:
             self._buffer += delta
             cbd = {
                 "type": "content_block_delta",
-                "index": data.get("content_index", 0),
+                "index": self._content_index,
                 "delta": {"type": "text_delta", "text": delta},
             }
             events.append(("content_block_delta", json.dumps(cbd)))
 
         return events
 
-    def _emit_content_block_stop(self) -> list[tuple[str, str]]:
-        """如果 content_block 已开始，发送 content_block_stop。"""
-        if self._content_block_started:
-            self._content_block_started = False
-            return [(
-                "content_block_stop",
-                json.dumps({"type": "content_block_stop", "index": 0}),
-            )]
-        return []
-
     def _on_completed(self, data: dict[str, Any]) -> list[tuple[str, str]]:
         events: list[tuple[str, str]] = []
-        # 先关闭 content block
+        # 先关闭当前 text content block
         events.extend(self._emit_content_block_stop())
 
         resp = data.get("response", data)
         status = resp.get("status", "completed")
         usage = resp.get("usage", {}) or {}
 
-        stop_reason_map = {
+        stop_reason_map: dict[str, str] = {
             "completed": "end_turn",
             "incomplete": "max_tokens",
         }
-        stop_reason = stop_reason_map.get(status, status)
+        if self._has_tool_use and status == "completed":
+            stop_reason = "tool_use"
+        else:
+            stop_reason = stop_reason_map.get(status, status)
 
         md = {
             "type": "message_delta",
@@ -542,7 +628,6 @@ class CodexStreamTranslator:
 
     def _on_failed(self, data: dict[str, Any]) -> list[tuple[str, str]]:
         events: list[tuple[str, str]] = []
-        # 先关闭 content block
         events.extend(self._emit_content_block_stop())
 
         err = data.get("error", {})

@@ -100,8 +100,36 @@ Edit `config.json` freely — missing keys merge with built-in defaults, so only
 - **Streaming** — SSE-to-SSE translation with minimal latency
 - **Atomic writes** — auth.json updates use tmp+rename to prevent corruption
 - **Error format** — all errors return Anthropic-compatible `{"type":"error","error":{...}}` responses
-- **Tool calls** — `tool_use`/`tool_result` content blocks are passed through as text context
+- **Structured input** — `tool_use`/`tool_result`/`thinking` content blocks are properly decoded and
+  forwarded to the Codex backend in their native format (not flattened to text)
+- **Model passthrough** — response model ID matches the original request model (fixes Claude Code v2
+  interactive display)
 - **anthropic-version header** — forwarded from request to response
+
+## Limitations
+
+### Tool calls
+
+The proxy forwards tool definitions (`tools`/`tool_choice`) to the Codex backend and translates
+Codex `function_call` output events back into Anthropic `tool_use` content blocks. However, the
+Codex Responses API may reject or fail on certain tool configurations. Tool call reliability
+depends on the backend.
+
+### Reasoning / Thinking
+
+The Codex Responses API does not support Anthropic's `thinking`/`thinking_config` parameters.
+Thinking content blocks in the input are silently ignored; any `reasoning` output from Codex is
+skipped.
+
+### `max_tokens`
+
+Codex Responses API does not support `max_output_tokens`. The `max_tokens` field is accepted but
+ignored.
+
+### `temperature` / `top_p`
+
+Codex Responses API does not support `temperature` or `top_p`. These fields are accepted but
+ignored.
 
 ## Troubleshooting
 
@@ -131,8 +159,20 @@ env -u HTTPS_PROXY -u HTTP_PROXY \
   claude --print "your prompt"
 ```
 
-
 ## Changelog
+
+### v0.4.0
+
+- **Structured message conversion** — `tool_use`/`tool_result`/`thinking` content blocks are now
+  properly converted to Codex input format (tool_calls / tool role) instead of flattened text
+- **Tool call SSE translation** — Codex `function_call` output items are translated to Anthropic
+  `tool_use` content blocks with correct `stop_reason: "tool_use"`
+- **Model passthrough** — SSE response model ID now matches the original request model, fixing
+  Claude Code v2 interactive display
+- **Config** — added `claude-sonnet-4-6` and `claude-opus-4-8` to model mapping
+- **Limitations documented** — Codex API constraints on `max_tokens`, `temperature`, `thinking`,
+  and tool call reliability are now explicitly listed
+- **Unit tests** — 18 tests covering message conversion, request translation, and SSE event handling
 
 ### v0.3.1
 
