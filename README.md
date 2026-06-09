@@ -1,71 +1,104 @@
 # Codex Proxy
 
-复用 Codex CLI 登录后的 `auth.json`，暴露 Anthropic Messages API 格式接口，
-让 **Claude Code** 能通过 ChatGPT Pro/Plus 账户调用 OpenAI 模型。
-
-## 原理
+Reuse the `auth.json` produced by `codex login` to expose an Anthropic Messages API endpoint,
+letting **Claude Code** call OpenAI models through a ChatGPT Pro/Plus subscription.
 
 ```
-Claude Code → Anthropic Messages API → Codex Proxy → ChatGPT Backend (chatgpt.com)
-                                                           ↑
-                                                     auth.json (access_token)
+Claude Code → POST /v1/messages (Anthropic format) → Codex Proxy → POST /responses (ChatGPT Backend) → chatgpt.com
+                                                                        ↑
+                                                                  auth.json (access_token)
 ```
 
-- 读取 `~/.codex/auth.json` 或当前目录下的 `auth.json`
-- 自动检测 token 过期并刷新
-- 将 Anthropic 格式翻译为 ChatGPT Backend Responses API 格式
-- 支持流式（SSE）和非流式响应
-
-## 快速开始
+## Quick Start
 
 ```bash
-# 1. 确保有 auth.json（来自 codex login）
+# 1. Make sure auth.json exists (from codex login)
 ls auth.json
 
-# 2. 启动 proxy
+# 2. Start the proxy
 uv run codex-proxy
 
-# 3. 在 Claude Code 中设置环境变量
+# 3. In another terminal, point Claude Code at the proxy
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
 export ANTHROPIC_API_KEY=sk-any-value
 
-# 4. 现在 Claude Code 会通过 proxy 调用 OpenAI 模型
+# 4. Claude Code now routes through the proxy
+claude --print "your prompt"
 ```
 
-## 环境变量
+## Configuration
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `CODEX_AUTH_PATH` | `auth.json` | auth.json 路径 |
-| `CODEX_BASE_URL` | `https://chatgpt.com/backend-api/codex` | Codex API 地址 |
-| `PROXY_HOST` | `127.0.0.1` | 监听地址 |
-| `PROXY_PORT` | `8080` | 监听端口 |
-| `PROXY_URL` | 无 | 出站代理地址（支持 http/socks5）|
-| `HTTP_PROXY` | 无 | 同 PROXY_URL（httpx 自动识别） |
-| `HTTPS_PROXY` | 无 | 同 PROXY_URL（httpx 自动识别） |
+### Environment Variables
 
-## 模型映射
+| Variable | Default | Description |
+|---|---|---|
+| `CODEX_AUTH_PATH` | `auth.json` | Path to the Codex auth file |
+| `CODEX_BASE_URL` | `https://chatgpt.com/backend-api/codex` | Codex API base URL |
+| `PROXY_HOST` | `127.0.0.1` | Listen address |
+| `PROXY_PORT` | `8080` | Listen port |
+| `PROXY_URL` | none | Upstream proxy (http/socks5) |
+| `HTTP_PROXY` | none | Same as PROXY_URL (httpx auto-detect) |
+| `HTTPS_PROXY` | none | Same as PROXY_URL (httpx auto-detect) |
 
-| Anthropic 模型名 | Codex 模型名 |
-|---|---|
-| `claude-sonnet-4-20250514` | `gpt-5.5` |
-| `claude-3-5-sonnet-20241022` | `gpt-5.5` |
-| `claude-3-5-haiku-latest` | `gpt-5.4-mini` |
-| `claude-opus-4-20250514` | `gpt-5.5` |
+### Model Mapping (`config.json`)
 
-## API 接口
+Model mappings are loaded from `config.json` at startup. If the file is missing or a field is absent, built-in defaults are used.
 
-| 路径 | 格式 | 说明 |
-|------|------|------|
-| `GET /health` | — | 健康检查 |
-| `GET /v1/models` | Anthropic | 列出可用模型 |
-| `POST /v1/messages` | Anthropic | Anthropic Messages API 兼容接口（主入口） |
-| `POST /v1/chat/completions` | OpenAI | OpenAI Chat Completions 兼容接口 |
+```json
+{
+  "model_mapping": {
+    "claude-sonnet-4-20250514": "gpt-5.5",
+    "claude-3-5-sonnet-latest": "gpt-5.5",
+    "claude-opus-4-7": "gpt-5.5",
+    "claude-3-5-haiku-latest": "gpt-5.4-mini"
+  },
+  "oai_model_mapping": {
+    "gpt-4o": "gpt-5.5",
+    "gpt-4o-mini": "gpt-5.4-mini"
+  },
+  "reverse_model_mapping": {
+    "gpt-5.5": "claude-sonnet-4-20250514",
+    "gpt-5.4-mini": "claude-3-5-haiku-latest"
+  },
+  "default_anthropic_model": "claude-sonnet-4-20250514",
+  "default_codex_model": "gpt-5.5"
+}
+```
 
-## 变更 (v0.3.0)
+- `model_mapping` — Anthropic model name → Codex model name (used for incoming `/v1/messages` requests).
+- `oai_model_mapping` — OpenAI model name → Codex model name (used for `/v1/chat/completions`).
+- `reverse_model_mapping` — Codex model name → Anthropic model name (used in responses).
+- Any model not in the map falls back to `default_codex_model` / `default_anthropic_model`.
 
-- **原子写入** — auth.json 刷新使用临时文件 + rename，防止写操作中断导致文件损坏
-- **格式兼容** — 支持 `anthropic-version` 请求头穿透；错误响应使用 Anthropic Messages API 格式
-- **Tool 支持** — 正确处理 `tool_use`/`tool_result` content blocks，不再跳过或告警
-- **Chat Completions** — 新增 `/v1/chat/completions` 端点，支持 OpenAI 格式的流式和非流式请求
-- **入口修复** — `uv run codex-proxy` 可直接启动
+Edit `config.json` freely — missing keys merge with built-in defaults so you only need to specify overrides.
+
+## API Endpoints
+
+| Path | Format | Description |
+|---|---|---|
+| `GET /` | — | Connectivity check (used by Claude Code) |
+| `GET /health` | — | Health check with auth status |
+| `GET /v1/models` | Anthropic | List available models (deduplicated) |
+| `POST /v1/messages` | Anthropic | Main entry — Anthropic Messages API proxy |
+| `POST /v1/chat/completions` | OpenAI | OpenAI Chat Completions proxy |
+
+## Features
+
+- **Token auto-refresh** — detects expired access tokens and refreshes via OAuth
+- **Streaming** — SSE-to-SSE translation with minimal latency
+- **Atomic writes** — auth.json updates use tmp+rename to prevent corruption
+- **Error format** — all errors return Anthropic-compatible `{"type":"error","error":{...}}` responses
+- **Tool calls** — `tool_use`/`tool_result` content blocks are passed through as text context
+- **anthropic-version header** — forwarded from request to response
+
+## Changelog (v0.3.0)
+
+- Configurable model mapping via `config.json` instead of hardcoded dict
+- Atomic tmp+rename writes for auth.json safety
+- `anthropic-version` header passthrough
+- Error responses in Anthropic `{"type":"error"}` format
+- Proper `tool_use`/`tool_result` content block handling
+- OpenAI `/v1/chat/completions` endpoint
+- Root `HEAD /` route for Claude Code connectivity check
+- Fixed `metadata` and `user` unsupported parameter errors
+- `uv run codex-proxy` entry point

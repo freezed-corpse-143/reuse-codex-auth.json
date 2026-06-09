@@ -50,35 +50,76 @@ PROXY_URL: str | None = (
     or os.environ.get("ALL_PROXY")
 )
 
-# Anthropic → Codex 模型映射表
-# Codex ChatGPT Pro 可用模型: gpt-5.5, gpt-5.4, gpt-5.4-mini, gpt-5.3-codex-spark
-MODEL_MAP: dict[str, str] = {
-    # claude-sonnet-4
+# ── Built-in defaults for model mapping (overridden by config.json) ──
+_DEFAULT_MODEL_MAP: dict[str, str] = {
     "claude-sonnet-4-20250514": "gpt-5.5",
     "claude-sonnet-4": "gpt-5.5",
     "claude-3-5-sonnet-20241022": "gpt-5.5",
     "claude-3-5-sonnet-latest": "gpt-5.5",
-    # claude-haiku
     "claude-3-5-haiku-latest": "gpt-5.4-mini",
     "claude-3-haiku-20240307": "gpt-5.4-mini",
     "claude-3-5-haiku-20241022": "gpt-5.4-mini",
-    # claude-opus
     "claude-opus-4-20250514": "gpt-5.5",
     "claude-opus-4": "gpt-5.5",
     "claude-opus-4-7": "gpt-5.5",
     "claude-3-opus-latest": "gpt-5.5",
 }
-
-# 反向映射（用于响应）— 每个 Codex 模型只保留最常用的一条映射
-REVERSE_MODEL_MAP: dict[str, str] = {
+_DEFAULT_REVERSE: dict[str, str] = {
     "gpt-5.5": "claude-sonnet-4-20250514",
     "gpt-5.4": "claude-sonnet-4",
     "gpt-5.4-mini": "claude-3-5-haiku-latest",
     "gpt-5.3-codex-spark": "claude-sonnet-4",
 }
+_DEFAULT_OAI_MAP: dict[str, str] = {
+    "gpt-4": "gpt-5.5",
+    "gpt-4o": "gpt-5.5",
+    "gpt-4o-mini": "gpt-5.4-mini",
+    "gpt-5": "gpt-5.5",
+    "gpt-5.5": "gpt-5.5",
+    "o3": "gpt-5.5",
+    "o4-mini": "gpt-5.4-mini",
+}
 
-DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-20250514"
-DEFAULT_CODEX_MODEL = "gpt-5.5"
+
+def _load_config() -> dict[str, Any]:
+    """Load config.json from CWD (or file next to proxy.py), merging with built-in defaults.
+
+    The user can copy config.json and edit any field — missing keys fall back to defaults.
+    """
+    cfg_path = next(
+        (p for p in (Path("config.json"), Path(__file__).parent / "config.json") if p.exists()),
+        None,
+    )
+    cfg: dict[str, Any] = {}
+    if cfg_path:
+        try:
+            raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                cfg = raw
+        except (json.JSONDecodeError, OSError) as exc:
+            log.warning("failed to parse %s: %s — using built-in defaults", cfg_path, exc)
+
+    def _merge(key: str, default: dict[str, str]) -> dict[str, str]:
+        val = cfg.get(key)
+        return {**default, **(val if isinstance(val, dict) else {})}
+
+    return {
+        "model_mapping": _merge("model_mapping", _DEFAULT_MODEL_MAP),
+        "reverse_model_mapping": _merge("reverse_model_mapping", _DEFAULT_REVERSE),
+        "oai_model_mapping": _merge("oai_model_mapping", _DEFAULT_OAI_MAP),
+        "default_anthropic_model": (
+            cfg.get("default_anthropic_model") or "claude-sonnet-4-20250514"
+        ),
+        "default_codex_model": cfg.get("default_codex_model") or "gpt-5.5",
+    }
+
+
+_CONFIG = _load_config()
+MODEL_MAP: dict[str, str] = _CONFIG["model_mapping"]
+REVERSE_MODEL_MAP: dict[str, str] = _CONFIG["reverse_model_mapping"]
+OAI_MODEL_MAP: dict[str, str] = _CONFIG["oai_model_mapping"]
+DEFAULT_ANTHROPIC_MODEL: str = _CONFIG["default_anthropic_model"]
+DEFAULT_CODEX_MODEL: str = _CONFIG["default_codex_model"]
 PROXY_REQUEST_ID_PREFIX = "msg_"
 
 
@@ -834,16 +875,6 @@ async def proxy_messages(request: Request):
     )
 
 
-# ── OpenAI Chat Completions 兼容 ──────────────────────────────────────────
-OAI_MODEL_MAP: dict[str, str] = {
-    "gpt-4": "gpt-5.5",
-    "gpt-4o": "gpt-5.5",
-    "gpt-4o-mini": "gpt-5.4-mini",
-    "gpt-5": "gpt-5.5",
-    "gpt-5.5": "gpt-5.5",
-    "o3": "gpt-5.5",
-    "o4-mini": "gpt-5.4-mini",
-}
 
 
 def _chatcompletions_to_codex(body: dict[str, Any]) -> dict[str, Any]:
