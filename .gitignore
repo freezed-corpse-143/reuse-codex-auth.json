@@ -1,0 +1,19 @@
+# ── Python ──
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.venv
+
+# ── Auth ──
+auth.json
+.auth.json.tmp
+
+# ── Editor ──
+.codegraph/
+
+# ── OS ──
+Thumbs.db
+.DS_Store

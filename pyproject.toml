@@ -1,0 +1,17 @@
+[project]
+name = "codex-proxy"
+version = "0.3.0"
+description = "复用 Codex CLI auth.json，暴露 Anthropic Messages API 供 Claude Code 使用"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi>=0.136.3",
+    "httpx[socks]>=0.28.1",
+    "uvicorn[standard]>=0.49.0",
+]
+
+[tool.uv]
+package = true
+
+[project.scripts]
+codex-proxy = "proxy:main"

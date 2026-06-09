@@ -1,0 +1,10 @@
+{
+  "OPENAI_API_KEY": null,
+  "last_refresh": "2026-01-01T00:00:00Z",
+  "tokens": {
+    "access_token": "eyJ... (来自 codex login 的 actual access_token)",
+    "account_id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+    "id_token": "eyJ... (来自 codex login 的 id_token)",
+    "refresh_token": "rt_... (来自 codex login 的 refresh_token)"
+  }
+}
