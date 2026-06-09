@@ -288,7 +288,11 @@ class AnthropicRequest(BaseModel):
 def _convert_message(msg: AnthropicMessage) -> list[dict[str, Any]]:
     """将一条 Anthropic 消息转换为 0~N 条 Codex input items。
 
-    处理 text / tool_use / tool_result / thinking 等 content block 类型。
+    Codex Responses API 的 input 只支持 role=user/assistant 的纯文本，
+    不支持 tool_calls / tool role 等结构化字段。
+    tool_use → 嵌入为文本 [tool_use: name args=...]
+    tool_result → 嵌入为文本 [tool_result: id content=...]
+    thinking/redacted_thinking → 忽略
     """
     content = msg.content
     if content is None:
@@ -298,22 +302,8 @@ def _convert_message(msg: AnthropicMessage) -> list[dict[str, Any]]:
     if isinstance(content, str):
         return [{"role": msg.role, "content": content}]
 
-    # 结构化 content (list of blocks)
-    items: list[dict[str, Any]] = []
+    # 结构化 content (list of blocks) → 合并为纯文本
     text_parts: list[str] = []
-    tool_calls: list[dict[str, Any]] = []
-
-    def flush_text() -> None:
-        if text_parts:
-            items.append({"role": msg.role, "content": "".join(text_parts)})
-            text_parts.clear()
-
-    def flush_tool_calls() -> None:
-        if tool_calls:
-            flush_text()
-            items.append({"role": msg.role, "tool_calls": list(tool_calls)})
-            tool_calls.clear()
-
     for block in content:
         if not isinstance(block, dict):
             continue
@@ -323,21 +313,14 @@ def _convert_message(msg: AnthropicMessage) -> list[dict[str, Any]]:
             text_parts.append(block.get("text", ""))
 
         elif bt == "tool_use":
-            flush_text()
-            name = block.get("name", "")
-            raw_input = block.get("input", {})
-            tool_calls.append({
-                "id": block.get("id", ""),
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": json.dumps(raw_input, ensure_ascii=False),
-                },
-            })
+            name = block.get("name", "unknown")
+            inp = block.get("input", {})
+            text_parts.append(
+                f"[tool_use: {name} args={json.dumps(inp, ensure_ascii=False)}]"
+            )
 
         elif bt == "tool_result":
-            flush_text()
-            flush_tool_calls()
+            tid = block.get("tool_use_id", "?")
             result_content = block.get("content", "")
             if isinstance(result_content, list):
                 result_text = ""
@@ -348,24 +331,16 @@ def _convert_message(msg: AnthropicMessage) -> list[dict[str, Any]]:
                 result_text = result_content
             else:
                 result_text = str(result_content)
-            items.append({
-                "role": "tool",
-                "tool_call_id": block.get("tool_use_id", ""),
-                "content": result_text,
-            })
+            text_parts.append(f"[tool_result: {tid} content={result_text}]")
 
         elif bt in ("thinking", "redacted_thinking"):
-            # Codex 不支持 reasoning/thinking 块，忽略
-            continue
+            continue  # 忽略
 
         else:
             log.warning("未知 content block 类型: %s", bt)
 
-    # 刷新剩余缓冲区
-    flush_tool_calls()
-    flush_text()
-
-    return items
+    full_text = "\n".join(text_parts)
+    return [{"role": msg.role, "content": full_text}] if full_text else []
 
 def map_model(anthropic_model: str) -> str:
     """将 Anthropic 模型名映射为 Codex 模型名。"""

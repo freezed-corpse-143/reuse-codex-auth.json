@@ -1,4 +1,9 @@
-"""单元测试：Anthropic ↔ Codex 格式转换。"""
+"""单元测试：Anthropic ↔ Codex 格式转换。
+
+input 方向：Codex Responses API 只支持纯文本 input，
+tool_use/tool_result 被嵌入为文本描述。
+output 方向：Codex function_call → Anthropic tool_use SSE。
+"""
 
 import json
 import sys
@@ -15,7 +20,8 @@ from proxy import (
 )
 
 
-# ── _convert_message ────────────────────────────────────────────────────
+# ── _convert_message (input 方向) ──────────────────────────────────────
+# Codex Responses API input 只支持纯文本，tool_use/tool_result 被压平
 
 def test_plain_text_string():
     msg = AnthropicMessage(role="user", content="Hello")
@@ -32,38 +38,45 @@ def test_multiple_text_blocks():
         {"type": "text", "text": "Hello, "},
         {"type": "text", "text": "world!"},
     ])
-    assert _convert_message(msg) == [{"role": "user", "content": "Hello, world!"}]
+    items = _convert_message(msg)
+    assert items[0]["content"] == "Hello, \nworld!"
 
 
-def test_tool_use():
+def test_tool_use_flattened():
+    """tool_use → 嵌入为文本"""
     msg = AnthropicMessage(role="assistant", content=[
         {"type": "text", "text": "I'll check."},
         {"type": "tool_use", "id": "call_abc", "name": "get_weather",
          "input": {"city": "Beijing"}},
     ])
     items = _convert_message(msg)
-    assert len(items) == 2
-    assert items[0] == {"role": "assistant", "content": "I'll check."}
-    assert items[1]["tool_calls"][0]["function"]["name"] == "get_weather"
-    assert items[1]["tool_calls"][0]["function"]["arguments"] == '{"city": "Beijing"}'
+    assert len(items) == 1
+    assert items[0]["role"] == "assistant"
+    assert "get_weather" in items[0]["content"]
+    assert "Beijing" in items[0]["content"]
 
 
-def test_tool_use_no_text():
+def test_tool_use_flattened_no_text():
+    """纯 tool_use（无前置文本）"""
     msg = AnthropicMessage(role="assistant", content=[
         {"type": "tool_use", "id": "call_1", "name": "search",
          "input": {"q": "weather"}},
     ])
     items = _convert_message(msg)
     assert len(items) == 1
-    assert items[0]["tool_calls"][0]["function"]["name"] == "search"
+    assert "[tool_use:" in items[0]["content"]
 
 
-def test_tool_result():
+def test_tool_result_flattened():
+    """tool_result → 嵌入为文本"""
     msg = AnthropicMessage(role="user", content=[
         {"type": "tool_result", "tool_use_id": "call_abc", "content": "22°C"},
     ])
     items = _convert_message(msg)
-    assert items == [{"role": "tool", "tool_call_id": "call_abc", "content": "22°C"}]
+    assert len(items) == 1
+    assert items[0]["role"] == "user"
+    assert "call_abc" in items[0]["content"]
+    assert "22°C" in items[0]["content"]
 
 
 def test_tool_result_list_content():
@@ -71,9 +84,8 @@ def test_tool_result_list_content():
         {"type": "tool_result", "tool_use_id": "call_1",
          "content": [{"type": "text", "text": "Result: 42"}]},
     ])
-    assert _convert_message(msg) == [
-        {"role": "tool", "tool_call_id": "call_1", "content": "Result: 42"}
-    ]
+    items = _convert_message(msg)
+    assert "Result: 42" in items[0]["content"]
 
 
 def test_thinking_ignored():
@@ -111,8 +123,8 @@ def test_multi_turn():
         all_items.extend(_convert_message(m))
     assert len(all_items) == 4
     assert all_items[0]["role"] == "user"
-    assert all_items[1]["role"] == "assistant" and "tool_calls" in all_items[1]
-    assert all_items[2]["role"] == "tool"
+    assert all_items[1]["role"] == "assistant"
+    assert all_items[2]["role"] == "user"
     assert all_items[3] == {"role": "assistant", "content": "It's 22°C."}
 
 
@@ -146,7 +158,7 @@ def test_max_tokens_ignored():
     assert "max_output_tokens" not in body
 
 
-# ── CodexStreamTranslator ──────────────────────────────────────────────
+# ── CodexStreamTranslator (output 方向) ────────────────────────────────
 
 def test_translator_text_message():
     t = CodexStreamTranslator("msg_test", "claude-sonnet-4-6")
