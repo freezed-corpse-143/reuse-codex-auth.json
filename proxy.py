@@ -418,6 +418,27 @@ def anthropic_to_codex(anth_req: AnthropicRequest) -> dict[str, Any]:
     if anth_req.stop_sequences:
         body["stop"] = anth_req.stop_sequences
 
+    # thinking → reasoning 映射
+    # 默认主动请求 Codex reasoning summary，不被动等待 Claude Code 的 thinking 配置。
+    # 原因：Claude Code 只对"支持 extended thinking 的模型"发送 thinking，
+    # 而这些模型恰映射到不暴露 reasoning 的 gpt-5.5；映射到 gpt-5.4-mini
+    #（会暴露 reasoning）的 Haiku 反而不发 thinking。
+    #
+    # 仅当 Claude Code 明确发送 thinking: {type: "disabled"} 时才跳过。
+    if anth_req.thinking and anth_req.thinking.get("type") == "disabled":
+        log.debug("thinking 已禁用，跳过 reasoning 配置")
+    else:
+        reasoning_config: dict[str, Any] = {"effort": "high", "summary": "detailed"}
+        if anth_req.thinking and isinstance(anth_req.thinking, dict):
+            budget = anth_req.thinking.get("budget_tokens", 0)
+            if isinstance(budget, (int, float)) and budget <= 1024:
+                reasoning_config["effort"] = "low"
+            elif isinstance(budget, (int, float)) and budget <= 4096:
+                reasoning_config["effort"] = "medium"
+            # budget_tokens > 4096 或未设置 → "high"（默认）
+        body["reasoning"] = reasoning_config
+        log.debug("thinking → reasoning 映射: %s", reasoning_config)
+
     log.debug("Codex 请求体: %s", json.dumps(body, ensure_ascii=False, default=str))
     return body
 
@@ -434,6 +455,9 @@ class CodexStreamTranslator:
         self._content_index = 0       # 当前 content block 序号
         self._buffer = ""             # text_delta 累积
         self._has_tool_use = False    # 本轮是否有 tool_use 输出
+        self._in_reasoning = False    # 是否正在处理 reasoning 输出 item
+        self._thinking_started = False  # 是否已发送 thinking content_block_start
+        self._thinking_buffer = ""    # reasoning summary 文本累积
     def process_event(
         self, event_name: str, data: dict[str, Any]
     ) -> list[tuple[str, str]]:
@@ -447,11 +471,26 @@ class CodexStreamTranslator:
         elif event_name == "response.output_item.added":
             events.extend(self._on_item_added(data))
 
+        elif event_name == "response.output_item.done":
+            events.extend(self._on_output_item_done(data))
+
         elif event_name == "response.content_part.added":
             events.extend(self._on_part_added(data))
 
         elif event_name == "response.output_text.delta":
             events.extend(self._on_text_delta(data))
+
+        elif event_name == "response.reasoning_summary_part.added":
+            events.extend(self._on_reasoning_summary_added(data))
+
+        elif event_name == "response.reasoning_summary_text.delta":
+            events.extend(self._on_reasoning_summary_delta(data))
+
+        elif event_name == "response.reasoning_summary_text.done":
+            events.extend(self._on_reasoning_summary_done(data))
+
+        elif event_name == "response.reasoning_summary_part.done":
+            events.extend(self._on_reasoning_summary_part_done(data))
 
         elif event_name == "response.completed":
             events.extend(self._on_completed(data))
@@ -547,16 +586,120 @@ class CodexStreamTranslator:
         item = data.get("item", data)
         itype = item.get("type", "")
         if itype == "message":
+            # 关闭前面的 reasoning/thinking block（如果有）
+            if self._in_reasoning:
+                events.extend(self._emit_thinking_block_stop())
+                self._in_reasoning = False
             events.extend(self._ensure_content_block_started())
         elif itype == "function_call":
             # 关闭当前 text block（如果有），再发出 tool_use block
+            if self._in_reasoning:
+                events.extend(self._emit_thinking_block_stop())
+                self._in_reasoning = False
             events.extend(self._emit_content_block_stop())
             events.extend(self._emit_tool_use_block(item))
             self._has_tool_use = True
+        elif itype == "reasoning":
+            # 开始新的 reasoning item — 等待 summary 文本
+            self._in_reasoning = True
+            self._thinking_buffer = ""
         return events
 
-    def _on_part_added(self, data: dict[str, Any]) -> list[tuple[str, str]]:
+    def _on_output_item_done(self, data: dict[str, Any]) -> list[tuple[str, str]]:
+        """处理 response.output_item.done — 输出 item 完成。"""
+        item = data.get("item", data)
+        itype = item.get("type", "")
+        if itype == "reasoning" and self._thinking_started:
+            # 完成 reasoning summary 文本的输出
+            return self._emit_thinking_block_stop()
         return []
+
+    def _on_part_added(self, data: dict[str, Any]) -> list[tuple[str, str]]:
+        # response.content_part.added — 不需要额外处理
+        # response.reasoning_summary_part.added 已通过 _on_reasoning_summary_added 处理
+        return []
+
+    # ── reasoning summary → thinking 翻译 ──────────────────────────────
+
+    def _on_reasoning_summary_added(self, data: dict[str, Any]) -> list[tuple[str, str]]:
+        """response.reasoning_summary_part.added → 开始 thinking content block。"""
+        events: list[tuple[str, str]] = []
+        if not self._in_reasoning:
+            return events
+        events.extend(self._ensure_message_started())
+        events.extend(self._emit_content_block_stop())  # 关闭前置 block
+        events.extend(self._emit_thinking_block_start())
+        return events
+
+    def _on_reasoning_summary_delta(self, data: dict[str, Any]) -> list[tuple[str, str]]:
+        """response.reasoning_summary_text.delta → thinking_delta。"""
+        events: list[tuple[str, str]] = []
+        if not self._in_reasoning:
+            return events
+        delta = data.get("delta", "")
+        if delta:
+            self._thinking_buffer += delta
+            events.append((
+                "content_block_delta",
+                json.dumps({
+                    "type": "content_block_delta",
+                    "index": self._content_index,
+                    "delta": {"type": "thinking_delta", "thinking": delta},
+                }),
+            ))
+        return events
+
+    def _on_reasoning_summary_done(self, data: dict[str, Any]) -> list[tuple[str, str]]:
+        """response.reasoning_summary_text.done — 无需额外操作（由 output_item.done 关闭 block）。"""
+        return []
+
+    def _on_reasoning_summary_part_done(self, data: dict[str, Any]) -> list[tuple[str, str]]:
+        """response.reasoning_summary_part.done — 无需额外操作。"""
+        return []
+
+    # ── thinking block 发送辅助 ────────────────────────────────────────
+
+    def _emit_thinking_block_start(self) -> list[tuple[str, str]]:
+        """发送 thinking content_block_start。"""
+        if self._thinking_started:
+            return []
+        self._thinking_started = True
+        idx = self._content_index
+        return [(
+            "content_block_start",
+            json.dumps({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {
+                    "type": "thinking",
+                    "thinking": "",
+                },
+            }),
+        )]
+
+    def _emit_thinking_block_stop(self) -> list[tuple[str, str]]:
+        """发送 signature_delta + content_block_stop（完成 thinking block）。"""
+        events: list[tuple[str, str]] = []
+        if not self._thinking_started:
+            return events
+        self._thinking_started = False
+        idx = self._content_index
+        self._content_index += 1
+        # signature_delta
+        events.append((
+            "signature_delta",
+            json.dumps({
+                "type": "signature_delta",
+                "index": idx,
+                "delta": {"type": "signature_delta", "signature": "codex-proxy-reasoning-summary"},
+            }),
+        ))
+        # content_block_stop
+        events.append((
+            "content_block_stop",
+            json.dumps({"type": "content_block_stop", "index": idx}),
+        ))
+        return events
 
     def _on_text_delta(self, data: dict[str, Any]) -> list[tuple[str, str]]:
         events: list[tuple[str, str]] = []
@@ -577,7 +720,11 @@ class CodexStreamTranslator:
 
     def _on_completed(self, data: dict[str, Any]) -> list[tuple[str, str]]:
         events: list[tuple[str, str]] = []
-        # 先关闭当前 text content block
+        # 关闭可能遗留的 thinking block
+        if self._thinking_started:
+            events.extend(self._emit_thinking_block_stop())
+        self._in_reasoning = False
+        # 关闭当前 text content block
         events.extend(self._emit_content_block_stop())
 
         resp = data.get("response", data)
@@ -607,6 +754,10 @@ class CodexStreamTranslator:
 
     def _on_failed(self, data: dict[str, Any]) -> list[tuple[str, str]]:
         events: list[tuple[str, str]] = []
+        # 关闭可能遗留的 thinking block
+        if self._thinking_started:
+            events.extend(self._emit_thinking_block_stop())
+        self._in_reasoning = False
         events.extend(self._emit_content_block_stop())
 
         err = data.get("error", {})

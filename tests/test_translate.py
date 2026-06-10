@@ -259,3 +259,279 @@ def test_translator_failed():
     assert any(e[0] == "message_delta" for e in ev)
     md = json.loads(next(e[1] for e in ev if e[0] == "message_delta"))
     assert md["delta"]["stop_reason"] == "error"
+
+
+# ── thinking → reasoning 转发 ─────────────────────────────────────────
+
+def test_thinking_config_forwarded():
+    """Anthropic thinking 参数 → Codex reasoning 配置。"""
+    req = AnthropicRequest(
+        model="claude-sonnet-4-6",
+        thinking={"type": "enabled", "budget_tokens": 16000},
+        messages=[AnthropicMessage(role="user", content="Solve a complex problem")],
+    )
+    body = anthropic_to_codex(req)
+    assert "reasoning" in body
+    assert body["reasoning"]["effort"] == "high"
+    assert body["reasoning"]["summary"] == "detailed"
+
+
+def test_thinking_low_budget():
+    """低 budget_tokens → low effort。"""
+    req = AnthropicRequest(
+        model="claude-sonnet-4-6",
+        thinking={"type": "enabled", "budget_tokens": 1024},
+        messages=[AnthropicMessage(role="user", content="hi")],
+    )
+    body = anthropic_to_codex(req)
+    assert body["reasoning"]["effort"] == "low"
+
+
+def test_thinking_medium_budget():
+    """中等 budget_tokens → medium effort。"""
+    req = AnthropicRequest(
+        model="claude-sonnet-4-6",
+        thinking={"type": "enabled", "budget_tokens": 4096},
+        messages=[AnthropicMessage(role="user", content="hi")],
+    )
+    body = anthropic_to_codex(req)
+    assert body["reasoning"]["effort"] == "medium"
+
+
+def test_thinking_disabled():
+    """thinking type=disabled → 不发送 reasoning。"""
+    req = AnthropicRequest(
+        model="claude-sonnet-4-6",
+        thinking={"type": "disabled", "budget_tokens": 0},
+        messages=[AnthropicMessage(role="user", content="hi")],
+    )
+    body = anthropic_to_codex(req)
+    assert "reasoning" not in body
+
+
+def test_no_thinking_config():
+    """没有 thinking 参数 → 默认启用 reasoning。"""
+    req = AnthropicRequest(
+        model="claude-sonnet-4-6",
+        messages=[AnthropicMessage(role="user", content="hi")],
+    )
+    body = anthropic_to_codex(req)
+    assert "reasoning" in body
+    assert body["reasoning"]["summary"] == "detailed"
+
+
+# ── CodexStreamTranslator: reasoning → thinking SSE ──────────────────
+
+def test_translator_reasoning_item_start():
+    """reasoning output item 添加 → 标记 _in_reasoning，不立即发送 block。"""
+    t = CodexStreamTranslator("msg_test", "claude-sonnet-4-6")
+    t.process_event("response.created", {})
+    ev = t.process_event("response.output_item.added", {
+        "item": {"id": "rs_1", "type": "reasoning", "content": [], "summary": []},
+    })
+    assert t._in_reasoning
+    # 在 summary 文本到达前不应发送 thinking block
+    assert not any("thinking" in (e[1] if len(e) > 1 else "") for e in ev)
+
+
+def test_translator_reasoning_summary_delta():
+    """reasoning_summary_text.delta → thinking_delta。"""
+    t = CodexStreamTranslator("msg_test", "claude-sonnet-4-6")
+    t.process_event("response.created", {})
+    t.process_event("response.output_item.added", {
+        "item": {"id": "rs_1", "type": "reasoning", "content": [], "summary": []},
+    })
+    t.process_event("response.reasoning_summary_part.added", {
+        "item_id": "rs_1", "output_index": 0,
+        "part": {"type": "summary_text", "text": ""},
+    })
+    ev = t.process_event("response.reasoning_summary_text.delta", {
+        "delta": "Let me think",
+        "item_id": "rs_1", "output_index": 0,
+    })
+    assert t._thinking_started
+    # 应该包含 content_block_delta with thinking_delta
+    delta_events = [e for e in ev if e[0] == "content_block_delta"]
+    assert len(delta_events) > 0
+    d = json.loads(delta_events[0][1])
+    assert d["delta"]["type"] == "thinking_delta"
+    assert d["delta"]["thinking"] == "Let me think"
+
+
+def test_translator_reasoning_to_text_transition():
+    """reasoning → message 过渡：先关闭 thinking block，再开始 text block。"""
+    t = CodexStreamTranslator("msg_test", "claude-sonnet-4-6")
+    t.process_event("response.created", {})
+
+    # Reasoning item
+    t.process_event("response.output_item.added", {
+        "item": {"id": "rs_1", "type": "reasoning", "content": [], "summary": []},
+    })
+    t.process_event("response.reasoning_summary_part.added", {
+        "item_id": "rs_1", "output_index": 0,
+        "part": {"type": "summary_text", "text": ""},
+    })
+    t.process_event("response.reasoning_summary_text.delta", {
+        "delta": "I should say hello",
+        "item_id": "rs_1", "output_index": 0,
+    })
+
+    # Reasoning done
+    ev_done = t.process_event("response.output_item.done", {
+        "item": {"id": "rs_1", "type": "reasoning", "content": [], "summary": []},
+    })
+    assert any(e[0] == "content_block_stop" for e in ev_done)
+    assert any(e[0] == "signature_delta" for e in ev_done)
+
+    # Message item (text)
+    ev_msg = t.process_event("response.output_item.added", {
+        "item": {"id": "msg_1", "type": "message", "status": "in_progress",
+                 "content": [], "role": "assistant"},
+    })
+    # 应该开始新的 text content block
+    cb_starts = [e for e in ev_msg if e[0] == "content_block_start"]
+    assert len(cb_starts) > 0
+    start = json.loads(cb_starts[0][1])
+    assert start["content_block"]["type"] == "text"
+
+
+def test_translator_reasoning_signature():
+    """reasoning 完成时 → 发送 signature_delta。"""
+    t = CodexStreamTranslator("msg_test", "claude-sonnet-4-6")
+    t.process_event("response.created", {})
+    t.process_event("response.output_item.added", {
+        "item": {"id": "rs_1", "type": "reasoning", "content": [], "summary": []},
+    })
+    t.process_event("response.reasoning_summary_part.added", {
+        "item_id": "rs_1", "output_index": 0,
+        "part": {"type": "summary_text", "text": ""},
+    })
+    t.process_event("response.reasoning_summary_text.delta", {
+        "delta": "Hmm...",
+        "item_id": "rs_1", "output_index": 0,
+    })
+    ev = t.process_event("response.output_item.done", {
+        "item": {"id": "rs_1", "type": "reasoning", "content": [], "summary": []},
+    })
+    sigs = [e for e in ev if e[0] == "signature_delta"]
+    assert len(sigs) == 1
+    sig = json.loads(sigs[0][1])
+    assert sig["delta"]["signature"] == "codex-proxy-reasoning-summary"
+
+
+def test_translator_empty_reasoning():
+    """空 reasoning（无 summary）→ 不发送 thinking block。"""
+    t = CodexStreamTranslator("msg_test", "claude-sonnet-4-6")
+    t.process_event("response.created", {})
+
+    # 空 reasoning item（无 summary_part events）
+    ev = t.process_event("response.output_item.added", {
+        "item": {"id": "rs_1", "type": "reasoning", "content": [], "summary": []},
+    })
+    assert t._in_reasoning
+    assert not t._thinking_started
+
+    # 直接 done
+    ev_done = t.process_event("response.output_item.done", {
+        "item": {"id": "rs_1", "type": "reasoning", "content": [], "summary": []},
+    })
+    # 不应发送 thinking 相关事件
+    assert not any("thinking" in (e[1] if len(e) > 1 else "") for e in ev_done)
+    assert not any(e[0] == "signature_delta" for e in ev_done)
+
+    # Message item → 应该正常工作
+    ev_msg = t.process_event("response.output_item.added", {
+        "item": {"id": "msg_1", "type": "message", "status": "in_progress",
+                 "content": [], "role": "assistant"},
+    })
+    cb_starts = [e for e in ev_msg if e[0] == "content_block_start"]
+    assert len(cb_starts) > 0
+
+
+# ── 集成：thinking + text + tool_use ─────────────────────────────────
+
+def test_reasoning_text_then_function_call():
+    """reasoning → text → function_call 过渡正确。"""
+    t = CodexStreamTranslator("msg_test", "claude-sonnet-4-6")
+    t.process_event("response.created", {})
+
+    # Reasoning
+    t.process_event("response.output_item.added", {
+        "item": {"id": "rs_1", "type": "reasoning", "content": [], "summary": []},
+    })
+    t.process_event("response.reasoning_summary_part.added", {
+        "item_id": "rs_1", "output_index": 0,
+        "part": {"type": "summary_text", "text": ""},
+    })
+    t.process_event("response.reasoning_summary_text.delta", {
+        "delta": "Need to check weather",
+        "item_id": "rs_1", "output_index": 0,
+    })
+    t.process_event("response.output_item.done", {
+        "item": {"id": "rs_1", "type": "reasoning"},
+    })
+
+    # Function call
+    ev = t.process_event("response.output_item.added", {
+        "item": {
+            "type": "function_call",
+            "id": "fc_1",
+            "function_call": {"name": "get_weather", "arguments": '{"city":"BJ"}'},
+        },
+    })
+    assert any(e[0] == "content_block_start" for e in ev)
+    start = json.loads([e[1] for e in ev if e[0] == "content_block_start"][0])
+    assert start["content_block"]["type"] == "tool_use"
+
+    # Complete
+    t.process_event("response.completed", {
+        "response": {"status": "completed", "usage": {"output_tokens": 5}},
+    })
+    assert t._has_tool_use
+
+
+# ── 默认 reasoning ─────────────────────────────────────────────────────
+
+def test_default_reasoning():
+    """无 thinking 参数时，默认请求 reasoning。"""
+    req = AnthropicRequest(
+        model="claude-3-5-haiku-latest",
+        messages=[AnthropicMessage(role="user", content="Solve a complex problem")],
+    )
+    body = anthropic_to_codex(req)
+    assert "reasoning" in body
+    assert body["reasoning"]["effort"] == "high"
+    assert body["reasoning"]["summary"] == "detailed"
+
+
+def test_thinking_disabled_no_reasoning():
+    """thinking type=disabled 时，不发送 reasoning。"""
+    req = AnthropicRequest(
+        model="claude-sonnet-4-6",
+        thinking={"type": "disabled", "budget_tokens": 0},
+        messages=[AnthropicMessage(role="user", content="hi")],
+    )
+    body = anthropic_to_codex(req)
+    assert "reasoning" not in body
+
+
+def test_thinking_enabled_with_budget():
+    """thinking type=enabled 时，根据 budget 设置 effort。"""
+    req = AnthropicRequest(
+        model="claude-sonnet-4-6",
+        thinking={"type": "enabled", "budget_tokens": 8000},
+        messages=[AnthropicMessage(role="user", content="Complex task")],
+    )
+    body = anthropic_to_codex(req)
+    assert body["reasoning"]["effort"] == "high"
+    assert body["reasoning"]["summary"] == "detailed"
+
+
+def test_reasoning_always_for_haiku():
+    """Haiku 模型（Claude Code 不发 thinking）→ 代理默认启用 reasoning。"""
+    req = AnthropicRequest(
+        model="claude-3-5-haiku-latest",
+        messages=[AnthropicMessage(role="user", content="What is 2+2?")],
+    )
+    body = anthropic_to_codex(req)
+    assert "reasoning" in body
